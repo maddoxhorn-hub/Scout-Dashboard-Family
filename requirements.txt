@@ -1,0 +1,9 @@
+streamlit
+pandas
+plotly
+gspread
+google-auth
+schwab-py
+requests
+pdfplumber
+tzdata

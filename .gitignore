@@ -1,0 +1,10 @@
+# Sensitive -- never commit or share these (see SETUP.md "Keep private")
+credentials.json
+schwab_token.json
+config.py
+data/
+
+# Local environment
+.venv/
+__pycache__/
+*.pyc
