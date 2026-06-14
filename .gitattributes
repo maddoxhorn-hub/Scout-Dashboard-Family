@@ -1,0 +1,5 @@
+# Keep macOS shell scripts LF so a Windows editor can't sneak in CRLF and
+# break the shebang on the family member's Mac.
+*.sh    text eol=lf
+*.command text eol=lf
+setup_mac.sh text eol=lf

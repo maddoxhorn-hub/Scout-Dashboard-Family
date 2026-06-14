@@ -36,6 +36,14 @@ cat > "$LAUNCHER" <<EOF
 #!/bin/bash
 cd "$HERE"
 PORT=8501
+# A finished Scout update leaves this marker -- stop the old (detached) server
+# so the next launch starts fresh and actually loads the new code. Closing the
+# window alone never stops the server, so without this the update is invisible.
+if [ -f ".scout_restart" ]; then
+  rm -f ".scout_restart"
+  pkill -f "streamlit run app.py" >/dev/null 2>&1 || true
+  sleep 1
+fi
 if ! curl -s -o /dev/null --max-time 1 "http://127.0.0.1:\$PORT"; then
   nohup ./.venv/bin/python -m streamlit run app.py --server.port \$PORT \\
     --server.headless true --browser.gatherUsageStats false >/dev/null 2>&1 &

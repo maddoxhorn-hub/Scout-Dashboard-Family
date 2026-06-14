@@ -19,6 +19,17 @@ function Test-ScoutPort {
     }
 }
 
+# A finished Scout update leaves this marker -- stop the old server so the
+# next launch loads the new code (closing the window alone won't do it).
+$restartMarker = Join-Path $here ".scout_restart"
+if (Test-Path $restartMarker) {
+    Remove-Item -Force $restartMarker -ErrorAction SilentlyContinue
+    Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match 'streamlit run' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 1
+}
+
 if (-not (Test-ScoutPort)) {
     # One argument string with explicit quotes: the folder name contains a
     # space, and Start-Process does not quote array elements on its own.

@@ -60,8 +60,21 @@ _SKIP_FILES = {
     "credentials.json", "schwab_token.json", "token.json",
     "alpaca_options.json", "plaid_keys.json", "plaid_tokens.json",
     "webull_openapi.json",
+    # Belt-and-suspenders: concrete personal data files that live under data/
+    # (already skipped by the dir rule) -- named here too so a same-named file
+    # arriving at any path can never clobber them.
+    "paper.db", "budget.db", "bank_session.json", "calls.jsonl",
+    "market_state.json", "market_settings.json", "watch_state.json",
+    "manual_watchlist.json",
+    # Local-only runtime markers (never come from the repo; never overwrite).
+    ".scout_restart", ".scout_update.lock",
 }
 _SKIP_SUFFIXES = {".pyc", ".command", ".bat", ".zip", ".log"}
+
+# Marker the launcher watches for: written on a successful update so the next
+# launch restarts the (long-lived, detached) Streamlit server and loads the
+# new code. Without this, closing the window leaves the old code running.
+RESTART_MARKER = APP_DIR / ".scout_restart"
 
 
 def _is_personal(rel_posix: str) -> bool:
@@ -74,6 +87,24 @@ def _is_personal(rel_posix: str) -> bool:
         return True
     suffix = ("." + name.rsplit(".", 1)[1]) if "." in name else ""
     return suffix in _SKIP_SUFFIXES
+
+
+def _is_safe_rel(rel_posix: str) -> bool:
+    """Reject path traversal / absolute paths (zip-slip defense). A release
+    member must land strictly inside the app folder."""
+    if not rel_posix or rel_posix.startswith("/") or rel_posix.startswith("\\"):
+        return False
+    if ".." in rel_posix.split("/"):
+        return False
+    # Windows drive-absolute (C:\...) or UNC.
+    if len(rel_posix) >= 2 and rel_posix[1] == ":":
+        return False
+    target = (APP_DIR / rel_posix).resolve()
+    try:
+        target.relative_to(APP_DIR.resolve())
+    except ValueError:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -147,15 +178,12 @@ def check(timeout: int = _TIMEOUT) -> dict:
             result["notes"] = ""
         result["available"] = is_newer(latest, result["current"])
         result["ok"] = True
-    except urllib.error.HTTPError as exc:
-        result["error"] = (
-            "Couldn't find the update (is the repo public?). "
-            f"[{exc.code}]"
-        )
-    except (urllib.error.URLError, TimeoutError, ssl.SSLError) as exc:
-        result["error"] = f"No internet, or GitHub unreachable ({exc})."
-    except Exception as exc:  # never let the UI crash on a check
-        result["error"] = f"Update check failed ({exc})."
+    except urllib.error.HTTPError:
+        result["error"] = "Couldn't reach the update server. Please try again later."
+    except (urllib.error.URLError, TimeoutError, ssl.SSLError):
+        result["error"] = "Couldn't connect — please check your internet and try again."
+    except Exception:  # never let the UI crash on a check
+        result["error"] = "Update check didn't work. Please try again later."
     return result
 
 
@@ -167,11 +195,31 @@ def _download_zip() -> zipfile.ZipFile:
     return zipfile.ZipFile(io.BytesIO(data))
 
 
+def _atomic_write(target: Path, src_fileobj) -> None:
+    """Write src into target atomically: a crash/power-loss mid-write leaves
+    the OLD file intact, never a truncated hybrid."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".scout_tmp_")
+    try:
+        with os.fdopen(fd, "wb") as dst:
+            shutil.copyfileobj(src_fileobj, dst)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(tmp, target)  # atomic on Windows and macOS
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def apply_update() -> dict:
     """Download the latest release and replace program files only.
 
     Returns {ok, from_version, to_version, changed, error}. On any failure
-    every change is rolled back, so Scout is never left half-updated.
+    every change is rolled back, so Scout is never left half-updated. On
+    success, writes RESTART_MARKER so the next launch loads the new code.
     """
     out = {"ok": False, "from_version": current_version(),
            "to_version": None, "changed": 0, "error": None}
@@ -180,7 +228,8 @@ def apply_update() -> dict:
         return out
 
     backup_dir = Path(tempfile.mkdtemp(prefix="scout_backup_"))
-    applied: list[tuple[Path, Path | None]] = []  # (target, backup or None=new)
+    applied: list = []  # (target, backup_path or None=file was new)
+    backup_kept = False
     try:
         zf = _download_zip()
         names = zf.namelist()
@@ -198,13 +247,20 @@ def apply_update() -> dict:
             if not name.startswith(root):
                 continue
             rel = name[len(root):]
-            if not rel or _is_personal(rel):
+            if not rel:
+                continue
+            # Refuse path traversal / absolute paths (zip-slip). A release
+            # with such a member is corrupt or tampered -- abort entirely.
+            if not _is_safe_rel(rel):
+                raise RuntimeError(f"refusing unsafe path in update: {rel}")
+            if _is_personal(rel):
                 continue
             members.append((rel, info))
 
         if not members:
             raise RuntimeError("update contained no program files")
 
+        applied_rels = set()
         for rel, info in members:
             target = APP_DIR / rel
             if target.exists():
@@ -214,17 +270,29 @@ def apply_update() -> dict:
                 applied.append((target, bkp))
             else:
                 applied.append((target, None))
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(info) as src, open(target, "wb") as dst:
-                shutil.copyfileobj(src, dst)
+            with zf.open(info) as src:
+                _atomic_write(target, src)
+            applied_rels.add(rel)
 
-        out["to_version"] = current_version()  # VERSION was just overwritten
+        # A release that didn't deliver a VERSION file means we can't trust
+        # that the update is complete -- treat it as a failure (rolls back).
+        if "VERSION" not in applied_rels:
+            raise RuntimeError("release did not contain a VERSION file")
+
+        out["to_version"] = current_version()  # VERSION was just rewritten
         out["changed"] = len(members)
         out["ok"] = True
+        # Tell the launcher to restart the server on next open (best effort).
+        try:
+            RESTART_MARKER.write_text("update applied\n", encoding="utf-8")
+        except OSError:
+            pass
         return out
 
     except Exception as exc:
-        # Roll everything back, newest change first.
+        # Roll everything back, newest change first, tracking any restore that
+        # itself fails so we never falsely claim "nothing changed".
+        restore_failures = []
         for target, bkp in reversed(applied):
             try:
                 if bkp is not None:
@@ -232,11 +300,23 @@ def apply_update() -> dict:
                 else:
                     target.unlink(missing_ok=True)
             except OSError:
-                pass
-        out["error"] = f"Update failed and was rolled back ({exc})."
+                restore_failures.append(str(target))
+        if restore_failures:
+            backup_kept = True
+            out["backup_kept"] = str(backup_dir)
+            out["error"] = (
+                "The update failed and some files couldn't be put back "
+                f"automatically. A backup was saved at: {backup_dir}. Close "
+                "Scout, open it again, and press Update once more; if it still "
+                "fails, reinstall Scout from the original files."
+            )
+        else:
+            out["error"] = "The update didn't work, so nothing was changed — Scout is exactly as it was."
         return out
     finally:
-        shutil.rmtree(backup_dir, ignore_errors=True)
+        # Keep the backup only when a restore failed (it's the recovery copy).
+        if not backup_kept:
+            shutil.rmtree(backup_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

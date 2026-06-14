@@ -29,6 +29,20 @@ def _render_updates():
     ui.section("Scout updates", "Get the latest version with one press")
     st.caption(f"You're on Scout **{updater.current_version()}**.")
 
+    # Sticky post-update message: survives the reruns that st.balloons() and
+    # any later click trigger, so the all-important restart step can't vanish.
+    done_ver = st.session_state.get("_update_done")
+    if done_ver:
+        st.success(f"✅ Updated to **{done_ver}**!")
+        st.info("**One last step:** close the Scout window, then open Scout "
+                "again from the **Desktop icon**. (That's what loads the new "
+                "version — your settings, accounts and data stay exactly as "
+                "they are.)")
+        if st.button("OK, got it", key="ack_update"):
+            st.session_state.pop("_update_done", None)
+            st.rerun()
+        return  # don't show check/update controls until acknowledged
+
     if st.button("Check for updates", width="stretch"):
         with st.spinner("Looking for a newer version…"):
             st.session_state["_update_check"] = updater.check()
@@ -52,12 +66,14 @@ def _render_updates():
                 done = updater.apply_update()
             if done["ok"]:
                 st.session_state.pop("_update_check", None)
-                st.success(f"Updated to **{done['to_version']}**. "
-                           "Close this window and open Scout again to finish.")
+                st.session_state["_update_done"] = done["to_version"]
+                # Stop the "newer version ready" banner from nagging now that
+                # we've applied it (the cached check is otherwise stale 6h).
+                st.cache_data.clear()
                 st.balloons()
+                st.rerun()
             else:
                 st.error(done["error"])
-                st.caption("Nothing was changed — your Scout is exactly as it was.")
     else:
         st.success(f"You're already up to date ({res['current']}).")
 

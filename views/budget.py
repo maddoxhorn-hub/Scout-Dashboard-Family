@@ -36,7 +36,8 @@ def render():
             "No transactions yet. Press **Get bank files** — your banks "
             "open in their own window; download the transactions CSV at "
             "each one and Scout imports the files the moment they land "
-            "in Downloads, then closes that window for you."
+            "in Downloads. You can close the bank window once each file "
+            "finishes downloading."
         )
         _get_files_button(primary=True)
         if plaid_state == "ready":
@@ -231,7 +232,8 @@ def _get_files_button(primary=False):
         if result["opened"]:
             st.toast(
                 "Banks opened in a new window — download the transactions "
-                "CSV at each one. Scout takes it from there."
+                "CSV at each one and Scout imports them automatically. You "
+                "can close the bank window when you're done."
             )
         else:
             st.toast("Couldn't open a browser window — check SETUP.md.")
