@@ -133,6 +133,21 @@ def _autopilot_panel(day_iso: str):
         st.toast("Autopilot is " + ("on" if chosen else "off"),
                  icon="🤖" if chosen else "💤")
 
+    use_tr = autopilot.use_trainer()
+    chosen_tr = st.toggle(
+        "Let my Trainer reads steer it",
+        value=use_tr, key="autopilot_trainer_toggle",
+        help="Before taking a pick, Scout checks the setup against YOUR Trainer "
+             "history: it skips setups you've read badly and half-sizes the "
+             "shaky ones, and notes your edge on the strong ones. It only acts "
+             "once you've logged enough similar calls, so a thin Trainer "
+             "history changes nothing. Uses your own data only; needs your "
+             "Alpaca data keys.",
+    )
+    if chosen_tr != use_tr:
+        autopilot.set_use_trainer(chosen_tr)
+        st.toast("Trainer steering " + ("on" if chosen_tr else "off"), icon="🧠")
+
     quotes = watcher.latest().get("quotes", {})
     summ = paper.summary(quotes)
     plays = autopilot.state().get("plays", {})
@@ -195,6 +210,8 @@ def _backtest_panel():
             d = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError):
             continue
+        if not isinstance(d, dict):
+            continue   # some backtest files are JSON lists, not result dicts
         if data is None or d.get("n_candidates", 0) > data.get("n_candidates", 0):
             data = d
     if data is None:

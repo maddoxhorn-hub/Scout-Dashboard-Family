@@ -517,6 +517,70 @@ def explain(row):
             "signature": _signature_text(row["label"], feat), "rate": rate}
 
 
+# ----------------------------------------------------------------------
+# Live edge lookup -- lets the paper autopilot weigh a real setup by what
+# the owner's own reads have learned (their discretionary edge, made mechanical).
+# Per-user + local: reads only this machine's calls; nothing is uploaded.
+# ----------------------------------------------------------------------
+
+EDGE_MIN_N = 5          # need this many similar past calls before acting
+BLINDSPOT_ACC = 0.35    # at/below this (with enough samples) -> skip the trade
+WEAK_ACC = 0.45         # below this -> half size
+EDGE_ACC = 0.60         # at/above this -> a proven edge
+
+
+def _live_snapshot(ticker, now):
+    """A feature-only snapshot for a LIVE symbol as of `now` (no future data)."""
+    ticker = str(ticker).split(":")[-1].strip().upper()   # NASDAQ:NVDA -> NVDA
+    today = now.date()
+    b10 = bars(ticker, "10m", (today - dt.timedelta(days=6)).isoformat(),
+               (today + dt.timedelta(days=1)).isoformat())
+    p10 = _tf_payload(b10, now, "10m")
+    if p10 is None:
+        return None
+    tf = {"10m": p10}
+    b1h = bars(ticker, "1h", (today - dt.timedelta(days=60)).isoformat(),
+               (today + dt.timedelta(days=1)).isoformat())
+    p1h = _tf_payload(b1h, now, "1h")
+    if p1h is not None:
+        tf["1h"] = p1h
+    return {"tf": tf, "levels": _levels(b10, today)}
+
+
+def live_setup_edge(ticker, direction, now=None):
+    """What the owner's reads have learned about THIS live setup. Computes the
+    setup fingerprint and looks up their hit rate on the matching signature.
+    Returns {verdict, signature, n, acc}; verdict is 'blindspot' | 'weak' |
+    'neutral' | 'edge' | 'unknown'. Never raises -- 'unknown' on any problem."""
+    label = "bull" if str(direction).lower() == "call" else "bear"
+    out = {"verdict": "unknown", "signature": None, "n": 0, "acc": None}
+    if not alpaca_options.configured():
+        return out                          # no data keys -> no signal
+    try:
+        snap = _live_snapshot(ticker, now or dt.datetime.now(ET))
+        if not snap:
+            return out
+        feat = setup_features(snap)
+        sig = (label, feat.get("cloud_3450"), feat.get("vs_vwap"))
+        out["signature"] = _signature_text(label, feat)
+        index, res = _pool_index(), []
+        for c in calls():
+            if c["label"] in ("bull", "bear") and c.get("correct") is not None:
+                cf = _call_features(c, index)
+                if (c["label"], cf.get("cloud_3450"), cf.get("vs_vwap")) == sig:
+                    res.append(1 if c["correct"] else 0)
+        out["n"] = len(res)
+        if len(res) >= EDGE_MIN_N:
+            acc = sum(res) / len(res)
+            out["acc"] = acc
+            out["verdict"] = ("blindspot" if acc <= BLINDSPOT_ACC
+                              else "weak" if acc < WEAK_ACC
+                              else "edge" if acc >= EDGE_ACC else "neutral")
+    except Exception:
+        return {"verdict": "unknown", "signature": None, "n": 0, "acc": None}
+    return out
+
+
 def record(snap, label, confidence):
     """Log a call and score it against the hidden multi-day outcome."""
     DIR.mkdir(parents=True, exist_ok=True)

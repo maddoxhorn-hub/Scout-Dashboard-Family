@@ -78,6 +78,25 @@ def set_enabled(on: bool):
     _write(SETTINGS_PATH, {**_read(SETTINGS_PATH, {}), "autopilot": bool(on)})
 
 
+def use_trainer() -> bool:
+    """Opt-in: let the owner's Trainer-learned reads steer entries."""
+    return bool(_read(SETTINGS_PATH, {}).get("autopilot_use_trainer", False))
+
+
+def set_use_trainer(on: bool):
+    _write(SETTINGS_PATH, {**_read(SETTINGS_PATH, {}), "autopilot_use_trainer": bool(on)})
+
+
+def _trainer_edge(ticker, direction, now):
+    """The owner's learned edge for this live setup, or a safe 'unknown'.
+    Lazy import keeps the watcher independent of the Trainer when unused."""
+    try:
+        from market import trainer
+        return trainer.live_setup_edge(ticker, direction, now)
+    except Exception:
+        return {"verdict": "unknown", "signature": None, "n": 0, "acc": None}
+
+
 def state() -> dict:
     return _read(STATE_PATH, {"plays": {}, "log": []})
 
@@ -256,8 +275,31 @@ def _hunt(st, now, sym, play, price, minute, quotes) -> bool:
     if not (confirmed and within_reach):
         return False
 
-    per_share_risk = abs(play["entry"] - play["stop"])
+    # Trainer-guided gate (opt-in): use only THIS machine's own practice calls
+    # to skip setups the owner reads badly and shrink the shaky ones. Acts only
+    # on a real sample (>= trainer.EDGE_MIN_N similar reads), so a thin history
+    # changes nothing.
     risk = RISK_DOLLARS[play["confidence"]]
+    trainer_tag = ""
+    if use_trainer():
+        edge = _trainer_edge(sym, play["direction"], now)
+        verdict = edge.get("verdict")
+        if verdict == "blindspot":
+            play["status"] = "skipped"
+            play["skip_reason"] = (
+                f"Trainer: \"{edge['signature']}\" is a blind spot for you "
+                f"({edge['acc']*100:.0f}% over {edge['n']} reads)")
+            _log(st, now, sym, "trainer_skip", play["skip_reason"])
+            return True
+        if verdict == "weak":
+            risk /= 2
+            trainer_tag = (f" · half size — Trainer: weak read on "
+                           f"\"{edge['signature']}\" ({edge['acc']*100:.0f}%)")
+        elif verdict == "edge":
+            trainer_tag = (f" · Trainer edge: \"{edge['signature']}\" "
+                           f"({edge['acc']*100:.0f}% over {edge['n']})")
+
+    per_share_risk = abs(play["entry"] - play["stop"])
     equity = paper.summary(quotes).get("equity") or paper.STARTING_CASH
     qty = int(min(risk / per_share_risk,
                   equity * MAX_POSITION_FRACTION / price))
@@ -288,7 +330,7 @@ def _hunt(st, now, sym, play, price, minute, quotes) -> bool:
                 entered_at=now.isoformat(timespec="seconds"))
     verb = "Bought" if side == "buy" else "Shorted"
     detail = (f"{verb} {qty} @ {price:,.2f} · stop {play['stop']:,.2f} · "
-              f"target {play['target']:,.2f}")
+              f"target {play['target']:,.2f}" + trainer_tag)
     _log(st, now, sym, "entered", detail)
     notify.toast(f"Autopilot: {sym}", detail)
     _enter_option(st, now, sym, play)
