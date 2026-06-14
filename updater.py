@@ -68,6 +68,9 @@ _SKIP_FILES = {
     "manual_watchlist.json",
     # Local-only runtime markers (never come from the repo; never overwrite).
     ".scout_restart", ".scout_update.lock",
+    # The shared-pool seed/partner reads are delivered privately (USB), not via
+    # the repo -- an update must never clobber them.
+    "seed_calls.jsonl", "partner_calls.jsonl",
 }
 _SKIP_SUFFIXES = {".pyc", ".command", ".bat", ".zip", ".log"}
 

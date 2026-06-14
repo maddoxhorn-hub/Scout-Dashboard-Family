@@ -35,6 +35,17 @@ POOL_DIR = Path("trainer_pool")          # SHARED practice charts (ships + auto-
 SNAP_FILE = POOL_DIR / "snapshots.json"
 CALLS_FILE = DIR / "calls.jsonl"
 CACHE = DIR / "_bars"
+# Shared-pool inputs. SEED = the trusted trader's reads, baked into a copy and
+# weighted high (his data is the proven core). PARTNER = another trader's reads
+# imported locally (e.g. carried over on the USB). Both feed the POOLED model
+# alongside this machine's own calls; neither replaces her own track record.
+SEED_FILE = POOL_DIR / "seed_calls.jsonl"
+PARTNER_FILE = DIR / "partner_calls.jsonl"
+SETTINGS_FILE = Path("data/market_settings.json")   # shared with the autopilot
+
+OWN_WEIGHT = 1.0
+SEED_WEIGHT = 3.0        # the trusted trader's reads count 3x in the pool
+PARTNER_WEIGHT = 1.0
 
 TF = {"2m": "2Min", "10m": "10Min", "1h": "1Hour"}
 RIPSTER_PAIRS = [(8, 9), (5, 13), (34, 50), (72, 89), (180, 200)]   # hlc3 source
@@ -282,23 +293,27 @@ def generate(n=10, seed=None):
 # Calls + analytics
 # ----------------------------------------------------------------------
 
+# NOTE: the cache-key params are NOT underscore-prefixed on purpose -- Streamlit
+# EXCLUDES underscore-named args from the cache key, which would (a) make all
+# files share one cache entry (fatal once we load several call files for the
+# pool) and (b) stop file edits from ever busting the cache. Plain names keep
+# the key = (path, mtime, size), so each file caches separately and refreshes.
 @st.cache_data(show_spinner=False)
-def _load_pool(_path, _mtime, _size):
-    """Cached + crash-safe parse of snapshots.json. Keyed on (mtime, size) so
-    a generate() (which rewrites the file) busts it even if mtime resolution
-    is coarse."""
+def _load_pool(path, mtime, size):
+    """Cached + crash-safe parse of a snapshots file. Keyed on (path, mtime,
+    size) so a rewrite busts it and different files don't collide."""
     try:
-        data = json.loads(Path(_path).read_text())
+        data = json.loads(Path(path).read_text())
         return data if isinstance(data, list) else []
     except (OSError, json.JSONDecodeError):
         return []          # corrupt or half-written -> don't crash the page
 
 
 @st.cache_data(show_spinner=False)
-def _load_calls(_path, _mtime, _size):
+def _load_calls(path, mtime, size):
     out = []
     try:
-        for line in Path(_path).read_text().splitlines():
+        for line in Path(path).read_text().splitlines():
             line = line.strip()
             if line:
                 try:
@@ -322,6 +337,51 @@ def calls():
         return []
     s = CALLS_FILE.stat()
     return _load_calls(str(CALLS_FILE), s.st_mtime, s.st_size)
+
+
+def _calls_from(path: Path):
+    if not path.exists():
+        return []
+    s = path.stat()
+    return _load_calls(str(path), s.st_mtime, s.st_size)
+
+
+def seed_calls():
+    """The trusted trader's reads shipped with this copy (may be empty)."""
+    return _calls_from(SEED_FILE)
+
+
+def partner_calls():
+    """A partner's reads imported onto this machine (may be empty)."""
+    return _calls_from(PARTNER_FILE)
+
+
+def pool_enabled() -> bool:
+    """Whether the shared pool (seed + partner) feeds the learning. Default on;
+    harmless where no seed/partner exists (pool == own calls)."""
+    try:
+        s = json.loads(SETTINGS_FILE.read_text(encoding="utf-8-sig"))
+        return bool(s.get("trainer_use_pool", True)) if isinstance(s, dict) else True
+    except (OSError, json.JSONDecodeError):
+        return True
+
+
+def set_pool_enabled(on: bool):
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    s = {}
+    try:
+        loaded = json.loads(SETTINGS_FILE.read_text(encoding="utf-8-sig"))
+        if isinstance(loaded, dict):
+            s = loaded
+    except (OSError, json.JSONDecodeError):
+        pass
+    s["trainer_use_pool"] = bool(on)
+    SETTINGS_FILE.write_text(json.dumps(s, indent=1), encoding="utf-8")
+
+
+def pool_sources():
+    """Counts behind the pool, for honest UI: (own, seed, partner)."""
+    return len(calls()), len(seed_calls()), len(partner_calls())
 
 
 def answered_ids():
@@ -450,39 +510,58 @@ def _signature_text(label, feat):
     return f"{dir_txt} on {' '.join(bits)}" if bits else dir_txt
 
 
-def _scored_rows():
-    """Her decisive (hit/miss) directional calls, paired with their features."""
+def _scored_rows(pooled=None):
+    """Decisive (hit/miss) directional calls as (call, features, weight). With
+    the pool on, adds the trusted seed (weight SEED_WEIGHT) and any imported
+    partner calls (PARTNER_WEIGHT) next to this machine's own (OWN_WEIGHT)."""
+    if pooled is None:
+        pooled = pool_enabled()
     index = _pool_index()
     out = []
-    for c in calls():
-        if c["label"] in ("bull", "bear") and c.get("correct") is not None:
-            out.append((c, _call_features(c, index)))
+
+    def add(rows, weight):
+        for c in rows:
+            if c.get("label") in ("bull", "bear") and c.get("correct") is not None:
+                out.append((c, _call_features(c, index), weight))
+
+    add(calls(), OWN_WEIGHT)
+    if pooled:
+        add(seed_calls(), SEED_WEIGHT)
+        add(partner_calls(), PARTNER_WEIGHT)
     return out
 
 
-def patterns(min_n=3):
-    """Learn which setups she reads well vs badly from her own scored calls.
-    Per-feature hit rates plus her strongest/weakest signatures (>= min_n)."""
-    rows = _scored_rows()
-    out = {"n": len(rows), "by_feature": {}, "strong": [], "weak": []}
+def patterns(min_n=3, pooled=None):
+    """Which setups are read well vs badly. Hit rates are WEIGHTED toward the
+    trusted seed (his reads count 3x); the sample gate uses the RAW count so a
+    thin history can't fire. Strongest/weakest signatures (raw n >= min_n)."""
+    rows = _scored_rows(pooled)
+    out = {"n": len(rows), "by_feature": {}, "strong": [], "weak": [],
+           "pooled": pool_enabled() if pooled is None else pooled}
     if not rows:
         return out
     for key in ("cloud_3450", "vs_vwap", "ema_stack", "short_trend", "regime"):
         vals = {}
-        for c, feat in rows:
+        for c, feat, w in rows:
             if key in feat:
-                vals.setdefault(feat[key], []).append(1 if c["correct"] else 0)
-        kept = {v: {"n": len(r), "acc": sum(r) / len(r)}
-                for v, r in vals.items() if len(r) >= min_n}
+                d = vals.setdefault(feat[key], {"wc": 0.0, "w": 0.0, "n": 0})
+                d["wc"] += w * (1 if c["correct"] else 0)
+                d["w"] += w
+                d["n"] += 1
+        kept = {v: {"n": d["n"], "acc": d["wc"] / d["w"]}
+                for v, d in vals.items() if d["n"] >= min_n}
         if kept:
             out["by_feature"][key] = kept
     sig = {}
-    for c, feat in rows:
+    for c, feat, w in rows:
         k = (c["label"], feat.get("cloud_3450"), feat.get("vs_vwap"))
-        sig.setdefault(k, {"text": _signature_text(c["label"], feat), "res": []})
-        sig[k]["res"].append(1 if c["correct"] else 0)
-    scored = [{"text": v["text"], "n": len(v["res"]), "acc": sum(v["res"]) / len(v["res"])}
-              for v in sig.values() if len(v["res"]) >= min_n]
+        d = sig.setdefault(k, {"text": _signature_text(c["label"], feat),
+                               "wc": 0.0, "w": 0.0, "n": 0})
+        d["wc"] += w * (1 if c["correct"] else 0)
+        d["w"] += w
+        d["n"] += 1
+    scored = [{"text": d["text"], "n": d["n"], "acc": d["wc"] / d["w"]}
+              for d in sig.values() if d["n"] >= min_n]
     out["strong"] = sorted((s for s in scored if s["acc"] >= 0.60),
                            key=lambda s: (-s["acc"], -s["n"]))
     out["weak"] = sorted((s for s in scored if s["acc"] < 0.45),
@@ -505,14 +584,14 @@ def explain(row):
         txt = FEATURE_TEXT[key][feat[key]]
         (aligned if favors_bull == bullish_call else against).append(txt)
     mysig = (row["label"], feat.get("cloud_3450"), feat.get("vs_vwap"))
-    index, same = _pool_index(), []
-    for c in calls():
-        if (c["label"] in ("bull", "bear") and c.get("correct") is not None
-                and c["id"] != row["id"]):
-            cf = _call_features(c, index)
-            if (c["label"], cf.get("cloud_3450"), cf.get("vs_vwap")) == mysig:
-                same.append(1 if c["correct"] else 0)
-    rate = {"n": len(same), "acc": (sum(same) / len(same)) if same else None}
+    wc = w = 0.0
+    n = 0
+    for c, cf, weight in _scored_rows():     # pooled + weighted per the setting
+        if (c["label"], cf.get("cloud_3450"), cf.get("vs_vwap")) == mysig:
+            wc += weight * (1 if c["correct"] else 0)
+            w += weight
+            n += 1
+    rate = {"n": n, "acc": (wc / w) if w else None}
     return {"aligned": aligned, "against": against,
             "signature": _signature_text(row["label"], feat), "rate": rate}
 
@@ -563,15 +642,16 @@ def live_setup_edge(ticker, direction, now=None):
         feat = setup_features(snap)
         sig = (label, feat.get("cloud_3450"), feat.get("vs_vwap"))
         out["signature"] = _signature_text(label, feat)
-        index, res = _pool_index(), []
-        for c in calls():
-            if c["label"] in ("bull", "bear") and c.get("correct") is not None:
-                cf = _call_features(c, index)
-                if (c["label"], cf.get("cloud_3450"), cf.get("vs_vwap")) == sig:
-                    res.append(1 if c["correct"] else 0)
-        out["n"] = len(res)
-        if len(res) >= EDGE_MIN_N:
-            acc = sum(res) / len(res)
+        wc = w = 0.0
+        n = 0
+        for c, cf, weight in _scored_rows():     # pooled + weighted per the setting
+            if (c["label"], cf.get("cloud_3450"), cf.get("vs_vwap")) == sig:
+                wc += weight * (1 if c["correct"] else 0)
+                w += weight
+                n += 1
+        out["n"] = n
+        if n >= EDGE_MIN_N:
+            acc = wc / w
             out["acc"] = acc
             out["verdict"] = ("blindspot" if acc <= BLINDSPOT_ACC
                               else "weak" if acc < WEAK_ACC
@@ -579,6 +659,65 @@ def live_setup_edge(ticker, direction, now=None):
     except Exception:
         return {"verdict": "unknown", "signature": None, "n": 0, "acc": None}
     return out
+
+
+def _sharing_rows(source):
+    """This machine's scored calls trimmed to the learning signal only (label,
+    confidence, correct, setup) -- not the full personal log. Features baked in
+    so the receiving copy needs no snapshot pool."""
+    index = _pool_index()
+    rows = []
+    for c in calls():
+        if c.get("label") not in ("bull", "bear") or c.get("correct") is None:
+            continue
+        rows.append({"id": c.get("id"), "label": c["label"],
+                     "confidence": c.get("confidence"), "correct": c["correct"],
+                     "setup": _call_features(c, index), "source": source})
+    return rows
+
+
+def calls_for_sharing(source="partner") -> str:
+    """JSONL text of this machine's reads, for a download/USB hand-off."""
+    return "\n".join(json.dumps(r) for r in _sharing_rows(source))
+
+
+def export_seed(out_path, source="seed"):
+    """Write this machine's reads as a SEED file (weighted high) for other
+    copies to learn from. Returns the count written."""
+    rows = _sharing_rows(source)
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+    return len(rows)
+
+
+def import_partner_calls(src_path, source="partner"):
+    """Bring another trader's scored calls onto THIS machine (e.g. carried over
+    on the USB) so the pool can learn from them at PARTNER_WEIGHT. Returns the
+    count imported. Their data stays local; nothing is uploaded."""
+    rows = []
+    for line in Path(src_path).read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            c = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if c.get("label") in ("bull", "bear") and c.get("correct") is not None:
+            c["source"] = source
+            rows.append(c)
+    PARTNER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with PARTNER_FILE.open("w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+    try:
+        _load_calls.clear()        # show the imported data immediately
+    except Exception:
+        pass
+    return len(rows)
 
 
 def record(snap, label, confidence):

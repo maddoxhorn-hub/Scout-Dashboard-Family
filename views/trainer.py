@@ -290,16 +290,33 @@ _VALUE_TITLE = {
 
 
 def _patterns():
+    own_n, seed_n, partner_n = trainer.pool_sources()
+    has_pool = (seed_n + partner_n) > 0
+    if has_pool:
+        new = st.toggle(
+            f"Learn from the shared pool · +{seed_n + partner_n} reads "
+            "(weighted toward the trusted set)",
+            value=trainer.pool_enabled(), key="trainer_pool_toggle",
+            help="On: the bot also learns from the seed/partner reads bundled "
+                 "with this copy, weighting the trusted set higher. Off: only "
+                 "your own calls. Your personal hit rate above is always just "
+                 "you, either way.")
+        if new != trainer.pool_enabled():
+            trainer.set_pool_enabled(new)
+            st.rerun()
+
     p = trainer.patterns(min_n=3)
     if p["n"] < 4:
         ui.section("What the Trainer is learning",
-                   "Patterns appear once you've logged a handful of scored calls")
-        st.caption(f"{p['n']} scored so far — keep going and your edges and blind "
+                   "Patterns appear once enough scored calls are in the pool")
+        st.caption(f"{p['n']} scored so far — keep going and edges and blind "
                    "spots show up here.")
         return
+    sub = ("Built from the shared pool — weighted toward the trusted reads"
+           if p.get("pooled") and has_pool
+           else "Built from your own scored calls")
     ui.section("What the Trainer is learning about your reads",
-               "Built from your own scored calls — where your edge lives and "
-               "which setups tend to burn you")
+               sub + " — where the edge lives and which setups tend to burn you")
     if p["strong"]:
         st.markdown("**🟢 Your edges** — setups you read well:")
         for s in p["strong"][:3]:
@@ -316,6 +333,39 @@ def _patterns():
             parts = [f"{_VALUE_TITLE.get(v, v)} {d['acc']*100:.0f}% (n={d['n']})"
                      for v, d in vals.items()]
             st.markdown(f"**{_FEATURE_TITLE.get(key, key)}** — " + " · ".join(parts))
+
+
+def _shared_pool():
+    own_n, seed_n, partner_n = trainer.pool_sources()
+    with st.expander("Shared pool — learn from another trader's reads"):
+        st.caption("Pool your graded calls with a partner's so the bot learns "
+                   "from more decisions. The trusted set is weighted higher. "
+                   "Everything stays on this computer — you share by file (e.g. "
+                   "on a USB stick), nothing is uploaded.")
+        text = trainer.calls_for_sharing()
+        st.download_button(
+            "⬇ Export my reads (to share)", data=text or "",
+            file_name="scout_reads.jsonl", mime="text/plain",
+            disabled=not text,
+            help="Saves your graded calls (just the read + outcome, no account "
+                 "info) so another Scout can learn from them.")
+        up = st.file_uploader("⬆ Add a partner's reads", type=["jsonl", "txt", "json"],
+                              key="partner_upload")
+        if up is not None and st.button("Import these reads"):
+            import tempfile
+            from pathlib import Path as _P
+            tmp = _P(tempfile.gettempdir()) / "scout_partner_upload.jsonl"
+            tmp.write_bytes(up.getvalue())
+            try:
+                n = trainer.import_partner_calls(str(tmp))
+                st.success(f"Imported {n} reads — they now feed your pool "
+                           "(at partner weight).")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Couldn't read that file ({exc}).")
+        if seed_n or partner_n:
+            st.caption(f"Pool right now: your **{own_n}** + **{seed_n}** seed + "
+                       f"**{partner_n}** partner reads.")
 
 
 def render():
@@ -339,6 +389,7 @@ def render():
     st.divider()
     _analytics()
     _patterns()
+    _shared_pool()
 
     with st.expander("Add more charts to the pool"):
         st.caption("New practice charts also arrive automatically with **Scout "

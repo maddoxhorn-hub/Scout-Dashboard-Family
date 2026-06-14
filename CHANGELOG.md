@@ -3,6 +3,15 @@
 The newest version is at the top. Open the **Links** tab and press
 **Check for updates** any time.
 
+## 1.4.0 — a shared learning pool
+- The Trainer can now learn from **more than one trader's** reads at once,
+  weighting the trusted set higher so a newer trader's calls can't drag it down
+- Your copy starts pre-seeded with a trusted set of reads; on the Trainer tab
+  you can **export** your own and **import** a partner's (share by file/USB —
+  nothing is uploaded)
+- Your personal hit rate always reflects only *your* calls
+- Fixed a caching quirk so freshly logged calls and new charts always show
+
 ## 1.3.0 — your reads can steer the paper autopilot
 - New opt-in on the Scans tab: **"Let my Trainer reads steer it"** — the paper
   autopilot skips setups you've historically read badly and shrinks shaky ones,
