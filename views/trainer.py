@@ -209,9 +209,38 @@ def _reveal_block(res):
                 tone=ui.tone_of(res.get("fwd_3d")),
                 note=f"2h: {_pct(res.get('fwd_2h'))}"),
     ])
+    _explain_setup(res)
     if st.button("Next chart →", type="primary"):
         st.session_state.pop("trainer_result", None)
         st.rerun()
+
+
+def _explain_setup(res):
+    """Tell her WHY: which conditions were for/against her call, and how she's
+    historically done on this kind of setup. This is the learning made visible."""
+    ex = trainer.explain(res)
+    if not ex:
+        return
+    g = res.get("grade")
+    if g == "miss":
+        ui.section("Why this was a tough setup",
+                   "The conditions that were working against your call")
+        if ex["against"]:
+            st.markdown("**Against your " + res["label"].upper() + " call:** "
+                        + " · ".join(ex["against"]))
+        if ex["aligned"]:
+            st.caption("In your favor: " + " · ".join(ex["aligned"]))
+        st.caption("The Trainer logs this setup so it learns the patterns that "
+                   "trip you up — and warns you when one shows up again.")
+    elif g == "hit":
+        ui.section("Why this setup worked", "What lined up behind your call")
+        if ex["aligned"]:
+            st.markdown("**In your favor:** " + " · ".join(ex["aligned"]))
+        if ex["against"]:
+            st.caption("Despite: " + " · ".join(ex["against"]))
+    if ex["rate"]["acc"] is not None and ex["rate"]["n"] >= 2:
+        st.caption(f"📊 On **{ex['signature']}**, you've been right "
+                   f"{ex['rate']['acc']*100:.0f}% across {ex['rate']['n']} similar calls.")
 
 
 def _analytics():
@@ -249,6 +278,46 @@ def _analytics():
         ui.row_list([(f"Confidence {k}/5", ui.pct(v)) for k, v in a["by_confidence"].items()])
 
 
+_FEATURE_TITLE = {
+    "cloud_3450": "34/50 cloud", "vs_vwap": "vs VWAP", "ema_stack": "EMA 8 vs 21",
+    "short_trend": "short-term trend", "regime": "1h regime (200-SMA)",
+}
+_VALUE_TITLE = {
+    "bull": "blue / bullish", "bear": "orange / bearish",
+    "above": "above", "below": "below", "8>21": "8 over 21", "8<21": "8 under 21",
+    "rising": "rising", "falling": "falling", "above200": "above", "below200": "below",
+}
+
+
+def _patterns():
+    p = trainer.patterns(min_n=3)
+    if p["n"] < 4:
+        ui.section("What the Trainer is learning",
+                   "Patterns appear once you've logged a handful of scored calls")
+        st.caption(f"{p['n']} scored so far — keep going and your edges and blind "
+                   "spots show up here.")
+        return
+    ui.section("What the Trainer is learning about your reads",
+               "Built from your own scored calls — where your edge lives and "
+               "which setups tend to burn you")
+    if p["strong"]:
+        st.markdown("**🟢 Your edges** — setups you read well:")
+        for s in p["strong"][:3]:
+            st.markdown(f"- {s['text']} — **{s['acc']*100:.0f}%** ({s['n']} calls)")
+    if p["weak"]:
+        st.markdown("**🔴 Blind spots** — setups that have gone against you:")
+        for s in p["weak"][:3]:
+            st.markdown(f"- {s['text']} — only **{s['acc']*100:.0f}%** ({s['n']} calls)")
+    if not p["strong"] and not p["weak"]:
+        st.caption("No strong edge or clear blind spot yet — your reads are "
+                   "fairly even across setups so far.")
+    with st.expander("Hit rate by condition"):
+        for key, vals in p["by_feature"].items():
+            parts = [f"{_VALUE_TITLE.get(v, v)} {d['acc']*100:.0f}% (n={d['n']})"
+                     for v, d in vals.items()]
+            st.markdown(f"**{_FEATURE_TITLE.get(key, key)}** — " + " · ".join(parts))
+
+
 def render():
     ui.section("Trainer", "Blinded real charts with your full setup — call the "
                "direction, build the record. Teaches the system how you read.")
@@ -269,10 +338,12 @@ def render():
 
     st.divider()
     _analytics()
+    _patterns()
 
     with st.expander("Add more charts to the pool"):
-        st.caption("Fetches fresh real snapshots (takes ~1–2 min). Do this when "
-                   "you're running low.")
+        st.caption("New practice charts also arrive automatically with **Scout "
+                   "updates** (Links → Check for updates). To fetch your own here "
+                   "you need your Alpaca data keys saved; it takes ~1–2 min.")
         n = st.number_input("How many", 5, 50, 15, step=5, key="gen_n")
         if st.button("Generate"):
             with st.spinner(f"Building {int(n)} blinded snapshots from real data…"):

@@ -30,8 +30,9 @@ from market import alpaca_options
 
 ET = ZoneInfo("America/New_York")
 DATA = "https://data.alpaca.markets/v2/stocks"
-DIR = Path("data/trainer")
-SNAP_FILE = DIR / "snapshots.json"
+DIR = Path("data/trainer")               # PERSONAL: her calls + bar cache (never synced)
+POOL_DIR = Path("trainer_pool")          # SHARED practice charts (ships + auto-updates)
+SNAP_FILE = POOL_DIR / "snapshots.json"
 CALLS_FILE = DIR / "calls.jsonl"
 CACHE = DIR / "_bars"
 
@@ -209,7 +210,7 @@ def _forward(daily_after, intraday_after, price_at_T):
 
 def generate(n=10, seed=None):
     """Build n blinded snapshots into the pool. Returns count added."""
-    DIR.mkdir(parents=True, exist_ok=True)
+    POOL_DIR.mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
     pool = json.loads(SNAP_FILE.read_text()) if SNAP_FILE.exists() else []
     existing = {s["id"] for s in pool}
@@ -361,6 +362,161 @@ def grade(outcomes, label):
     return "chop", 0.0
 
 
+# ----------------------------------------------------------------------
+# Setup features + pattern learning -- which setups she reads well vs badly,
+# learned from her own scored calls. This is what turns the Trainer from a
+# scoreboard into a system that recognizes (and explains) her patterns.
+# ----------------------------------------------------------------------
+
+def _last(seq):
+    for v in reversed(seq or []):
+        if v is not None:
+            return v
+    return None
+
+
+# Plain-English label for each feature value (used in feedback + the patterns
+# view). Each tuple's 2nd item is the value that FAVORS a bullish call.
+FEATURE_TEXT = {
+    "cloud_3450": {"bull": "a blue (bullish) 34/50 cloud", "bear": "an orange (bearish) 34/50 cloud"},
+    "vs_vwap": {"above": "price above VWAP", "below": "price below VWAP"},
+    "ema_stack": {"8>21": "EMA-8 above EMA-21", "8<21": "EMA-8 below EMA-21"},
+    "short_trend": {"rising": "the short-term trend rising", "falling": "the short-term trend falling"},
+    "regime": {"above200": "trading above the 1h 200-SMA", "below200": "trading below the 1h 200-SMA"},
+}
+# (feature, value-that-favors-a-bull-call)
+_BULL_SIDE = {"cloud_3450": "bull", "vs_vwap": "above", "ema_stack": "8>21",
+              "short_trend": "rising", "regime": "above200"}
+
+
+def setup_features(snap):
+    """The conditions present AT the decision moment -- the 'setup fingerprint'.
+    Computed only from the stored snapshot bars/indicators (no future data)."""
+    f = {}
+    tf = snap.get("tf", {})
+    m = tf.get("10m") or tf.get("2m")
+    if m and m.get("bars"):
+        close = m["bars"][-1]["c"]
+        vwap = _last(m.get("vwap"))
+        ema8, ema21 = _last(m.get("ema8")), _last(m.get("ema21"))
+        clouds = m.get("clouds") or []
+        if len(clouds) >= 3:                       # clouds[2] == the 34/50 cloud
+            cf, cs = _last(clouds[2].get("fast")), _last(clouds[2].get("slow"))
+            if cf is not None and cs is not None:
+                f["cloud_3450"] = "bull" if cf >= cs else "bear"
+        if vwap is not None:
+            f["vs_vwap"] = "above" if close >= vwap else "below"
+        if ema8 is not None and ema21 is not None:
+            f["ema_stack"] = "8>21" if ema8 >= ema21 else "8<21"
+        e8 = [v for v in (m.get("ema8") or [])[-10:] if v is not None]
+        if len(e8) >= 2:
+            f["short_trend"] = "rising" if e8[-1] >= e8[0] else "falling"
+        lv = snap.get("levels", {})
+        if lv and close:
+            near, best = "open_space", 0.008       # "near" a level == within 0.8%
+            for k, v in lv.items():
+                d = abs(close - v) / close
+                if d < best:
+                    best, near = d, k
+            f["near_level"] = near
+    h = tf.get("1h")
+    if h and h.get("bars"):
+        hs = _last(h.get("sma200"))
+        if hs is not None:
+            f["regime"] = "above200" if h["bars"][-1]["c"] >= hs else "below200"
+    return f
+
+
+def _pool_index():
+    return {s["id"]: s for s in pool()}
+
+
+def _call_features(row, index):
+    """Stored fingerprint, or recomputed from the snapshot for older calls."""
+    if row.get("setup"):
+        return row["setup"]
+    s = index.get(row["id"])
+    return setup_features(s) if s else {}
+
+
+def _signature_text(label, feat):
+    """The strategy's core combo: direction + Ripster cloud + VWAP position."""
+    dir_txt = "calls" if label == "bull" else "puts"
+    bits = []
+    if "cloud_3450" in feat:
+        bits.append("a blue cloud" if feat["cloud_3450"] == "bull" else "an orange cloud")
+    if "vs_vwap" in feat:
+        bits.append("above VWAP" if feat["vs_vwap"] == "above" else "below VWAP")
+    return f"{dir_txt} on {' '.join(bits)}" if bits else dir_txt
+
+
+def _scored_rows():
+    """Her decisive (hit/miss) directional calls, paired with their features."""
+    index = _pool_index()
+    out = []
+    for c in calls():
+        if c["label"] in ("bull", "bear") and c.get("correct") is not None:
+            out.append((c, _call_features(c, index)))
+    return out
+
+
+def patterns(min_n=3):
+    """Learn which setups she reads well vs badly from her own scored calls.
+    Per-feature hit rates plus her strongest/weakest signatures (>= min_n)."""
+    rows = _scored_rows()
+    out = {"n": len(rows), "by_feature": {}, "strong": [], "weak": []}
+    if not rows:
+        return out
+    for key in ("cloud_3450", "vs_vwap", "ema_stack", "short_trend", "regime"):
+        vals = {}
+        for c, feat in rows:
+            if key in feat:
+                vals.setdefault(feat[key], []).append(1 if c["correct"] else 0)
+        kept = {v: {"n": len(r), "acc": sum(r) / len(r)}
+                for v, r in vals.items() if len(r) >= min_n}
+        if kept:
+            out["by_feature"][key] = kept
+    sig = {}
+    for c, feat in rows:
+        k = (c["label"], feat.get("cloud_3450"), feat.get("vs_vwap"))
+        sig.setdefault(k, {"text": _signature_text(c["label"], feat), "res": []})
+        sig[k]["res"].append(1 if c["correct"] else 0)
+    scored = [{"text": v["text"], "n": len(v["res"]), "acc": sum(v["res"]) / len(v["res"])}
+              for v in sig.values() if len(v["res"]) >= min_n]
+    out["strong"] = sorted((s for s in scored if s["acc"] >= 0.60),
+                           key=lambda s: (-s["acc"], -s["n"]))
+    out["weak"] = sorted((s for s in scored if s["acc"] < 0.45),
+                         key=lambda s: (s["acc"], -s["n"]))
+    return out
+
+
+def explain(row):
+    """Plain-English 'why' for one graded call: which conditions were for vs
+    against the call, plus her track record on that exact signature."""
+    feat = row.get("setup") or _call_features(row, _pool_index())
+    if row["label"] not in ("bull", "bear") or not feat:
+        return None
+    bullish_call = row["label"] == "bull"
+    aligned, against = [], []
+    for key, bull_val in _BULL_SIDE.items():
+        if key not in feat:
+            continue
+        favors_bull = feat[key] == bull_val
+        txt = FEATURE_TEXT[key][feat[key]]
+        (aligned if favors_bull == bullish_call else against).append(txt)
+    mysig = (row["label"], feat.get("cloud_3450"), feat.get("vs_vwap"))
+    index, same = _pool_index(), []
+    for c in calls():
+        if (c["label"] in ("bull", "bear") and c.get("correct") is not None
+                and c["id"] != row["id"]):
+            cf = _call_features(c, index)
+            if (c["label"], cf.get("cloud_3450"), cf.get("vs_vwap")) == mysig:
+                same.append(1 if c["correct"] else 0)
+    rate = {"n": len(same), "acc": (sum(same) / len(same)) if same else None}
+    return {"aligned": aligned, "against": against,
+            "signature": _signature_text(row["label"], feat), "rate": rate}
+
+
 def record(snap, label, confidence):
     """Log a call and score it against the hidden multi-day outcome."""
     DIR.mkdir(parents=True, exist_ok=True)
@@ -374,6 +530,7 @@ def record(snap, label, confidence):
            "at": dt.datetime.now(ET).isoformat(timespec="seconds"),
            "label": label, "confidence": confidence, "grade": g,
            "fav_move": fav,
+           "setup": setup_features(snap),   # the fingerprint -> pattern learning
            "mfe_3d": o.get("mfe_3d"), "mae_3d": o.get("mae_3d"),
            "fwd_2h": o.get("fwd_2h"), "fwd_1d": o.get("fwd_1d"),
            "fwd_3d": o.get("fwd_3d"), "correct": correct}
