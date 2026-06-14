@@ -38,7 +38,7 @@ from pathlib import Path
 # Format: "username/reponame".  Branch is usually "main".
 # An env var can override it (handy for testing) without editing code.
 # ---------------------------------------------------------------------------
-UPDATE_REPO = os.environ.get("SCOUT_UPDATE_REPO", "__SET_THIS__/scout-dashboard")
+UPDATE_REPO = os.environ.get("SCOUT_UPDATE_REPO", "maddoxhorn-hub/Scout-Dashboard-Family")
 UPDATE_BRANCH = os.environ.get("SCOUT_UPDATE_BRANCH", "main")
 
 APP_DIR = Path(__file__).resolve().parent
